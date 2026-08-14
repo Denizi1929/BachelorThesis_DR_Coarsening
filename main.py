@@ -8,21 +8,17 @@ import time
 import numpy as np
 import scipy.sparse as sp
 from sklearn.manifold import TSNE
-from sklearn.datasets import fetch_openml, load_digits
+from sklearn.datasets import fetch_openml
 import matplotlib.pyplot as plt
 import zadu
 
+try:
+    import pynndescent
 
-class DRBenchmarkLoader:
-    def __init__(self, download_dir="./benchmark_data"):
-        self.download_dir = download_dir
-        os.makedirs(self.download_dir, exist_ok=True)
-
-    def load_dataset_from_npz(self, file_path):
-        data = np.load(file_path)
-        X = data['X'].astype(np.float32)
-        y = data['y'] if 'y' in data else None
-        return X, y
+    HAS_PYNNDESCENT = True
+except ImportError:
+    HAS_PYNNDESCENT = False
+    from sklearn.neighbors import NearestNeighbors
 
 
 class MultilevelTSNE:
@@ -34,21 +30,24 @@ class MultilevelTSNE:
         self.refine_iterations = max(250, refine_iterations)
 
     def _build_knn_graph(self, X, k=30):
-        from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=k, algorithm='kd_tree', n_jobs=-1)
-        nn.fit(X)
-        distances, indices = nn.kneighbors(X)
-
         n_samples = X.shape[0]
+        if HAS_PYNNDESCENT and n_samples > 2000:
+            index = pynndescent.NNDescent(X, n_neighbors=k + 1, n_jobs=-1)
+            indices, _ = index.query(X, k=k + 1)
+            indices = indices[:, 1:]
+        else:
+            nn = NearestNeighbors(n_neighbors=k, algorithm='auto', n_jobs=-1)
+            nn.fit(X)
+            _, indices = nn.kneighbors(X)
+
         row_indices = np.repeat(np.arange(n_samples), k)
         col_indices = indices.flatten()
         data = np.ones(n_samples * k, dtype=np.float32)
 
         W_sparse = sp.csr_matrix((data, (row_indices, col_indices)), shape=(n_samples, n_samples))
-        W_symmetric = (W_sparse + W_sparse.T) / 2.0
-        return W_symmetric
+        return (W_sparse + W_sparse.T) / 2.0
 
-    def _coarsen_heavy_edge_matching(self, W):
+    def _coarsen_heavy_edge_matching(self, W, X_curr):
         n_nodes = W.shape[0]
         visited = np.zeros(n_nodes, dtype=bool)
         parent_mapping = np.zeros(n_nodes, dtype=int)
@@ -60,10 +59,8 @@ class MultilevelTSNE:
         for idx in sorted_indices:
             u, v = W_coo.row[idx], W_coo.col[idx]
             if not visited[u] and not visited[v] and u != v:
-                visited[u] = True
-                visited[v] = True
-                parent_mapping[u] = coarse_id
-                parent_mapping[v] = coarse_id
+                visited[u] = visited[v] = True
+                parent_mapping[u] = parent_mapping[v] = coarse_id
                 coarse_id += 1
 
         for node in range(n_nodes):
@@ -74,206 +71,132 @@ class MultilevelTSNE:
         P = sp.csr_matrix((np.ones(n_nodes), (parent_mapping, np.arange(n_nodes))), shape=(coarse_id, n_nodes))
         W_coarse = P.dot(W).dot(P.T)
 
-        return W_coarse, parent_mapping
+        degree = np.array(P.sum(axis=1)).flatten()
+        degree[degree == 0] = 1.0
+        P_norm = sp.diags(1.0 / degree).dot(P)
+        X_coarse = P_norm.dot(X_curr)
+
+        return W_coarse, parent_mapping, X_coarse
 
     def fit_transform(self, X):
         N = X.shape[0]
-
         if self.perplexity is None:
             self.perplexity = int(np.clip(np.sqrt(N), 15, 50))
-
         if self.n_levels is None:
             target_base_size = 400
             self.n_levels = max(1, int(np.round(np.log2(N / target_base_size))))
 
-        print(f"[Phase 1] Constructing k-NN Similarity Graph for N={X.shape[0]}...")
         G0 = self._build_knn_graph(X, k=self.perplexity)
+        graph_hierarchy, mapping_hierarchy, feature_hierarchy = [G0], [], [X]
 
-        graph_hierarchy = [G0]
-        mapping_hierarchy = []
-
-        curr_G = G0
+        curr_G, curr_X = G0, X
         for l in range(self.n_levels):
-            print(f"[Phase 2] Coarsening Level {l} -> {l + 1} (Nodes: {curr_G.shape[0]})...")
-            curr_G, mapping = self._coarsen_heavy_edge_matching(curr_G)
+            curr_G, mapping, curr_X = self._coarsen_heavy_edge_matching(curr_G, curr_X)
             graph_hierarchy.append(curr_G)
             mapping_hierarchy.append(mapping)
+            feature_hierarchy.append(curr_X)
 
-        coarsest_G = graph_hierarchy[-1]
-        print(f"[Phase 3] Optimizing Coarsest Base Graph GL (Nodes: {coarsest_G.shape[0]})...")
-
+        coarsest_G, coarsest_X = graph_hierarchy[-1], feature_hierarchy[-1]
+        base_perp = min(15, max(5, coarsest_G.shape[0] - 2))
         base_tsne = TSNE(
-            n_components=self.n_components,
-            perplexity=min(15, coarsest_G.shape[0] - 1),
-            max_iter=self.base_iterations,
-            init='random',
-            random_state=42
+            n_components=self.n_components, perplexity=base_perp,
+            max_iter=self.base_iterations, init='random',
+            method='barnes_hut', random_state=42
         )
-        Y_coarse = base_tsne.fit_transform(coarsest_G.toarray())
+        Y_current = base_tsne.fit_transform(coarsest_X)
 
-        Y_current = Y_coarse
         for l in reversed(range(self.n_levels)):
             mapping = mapping_hierarchy[l]
-            finer_G = graph_hierarchy[l]
-            print(f"[Phase 3] Uncoarsening Level {l + 1} -> {l} (Refining {finer_G.shape[0]} nodes)...")
+            finer_X = feature_hierarchy[l]
+            n_finer = finer_X.shape[0]
 
-            n_finer = finer_G.shape[0]
             Y_interpolated = np.zeros((n_finer, self.n_components), dtype=np.float32)
             for child_idx in range(n_finer):
-                parent_idx = mapping[child_idx]
-                jitter = np.random.normal(0, 0.5, size=self.n_components)
-                Y_interpolated[child_idx] = Y_current[parent_idx] + jitter
+                Y_interpolated[child_idx] = Y_current[mapping[child_idx]] + np.random.normal(0, 0.5,
+                                                                                             size=self.n_components)
 
-            # Standardize and scale coordinates so t-SNE forces spread out properly
-            Y_interpolated = (Y_interpolated - np.mean(Y_interpolated, axis=0)) / (np.std(Y_interpolated, axis=0) + 1e-5) * 1e-4
-
-            # Set iterations: full level (l=0) gets more steps to relax clusters
+            Y_interpolated = (Y_interpolated - np.mean(Y_interpolated, axis=0)) / (
+                        np.std(Y_interpolated, axis=0) + 1e-5) * 1e-4
             iters = 500 if l == 0 else self.refine_iterations
 
             refine_tsne = TSNE(
-                n_components=self.n_components,
-                perplexity=self.perplexity,
-                max_iter=iters,
-                init=Y_interpolated,
-                learning_rate='auto',
-                random_state=42
+                n_components=self.n_components, perplexity=self.perplexity,
+                max_iter=iters, init=Y_interpolated,
+                learning_rate='auto', method='barnes_hut', random_state=42
             )
-            Y_current = refine_tsne.fit_transform(X[:n_finer])
+            Y_current = refine_tsne.fit_transform(finer_X)
 
         return Y_current
 
-def run_evaluation_experiment(X, Y_multilevel, Y_baseline):
-    print("\nRunning Quantitative Evaluation...")
+
+def load_dataset(dataset_name, n_samples=None):
+    print(f"\n==========================================")
+    print(f"Loading Dataset: {dataset_name}...")
+
+    if dataset_name == "COIL-20":
+        data = fetch_openml(data_id=46783, as_frame=False, parser='liac-arff')
+    elif dataset_name == "USPS":
+        data = fetch_openml(data_id=41082, as_frame=False, parser='liac-arff')
+    elif dataset_name == "Pendigits":
+        data = fetch_openml('pendigits', version=1, as_frame=False, parser='liac-arff')
+    elif dataset_name == "MNIST":
+        data = fetch_openml('mnist_784', version=1, as_frame=False, parser='liac-arff')
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    X = data.data.astype(np.float32)
+    y = data.target.astype(int)
+
+    if n_samples is not None and n_samples < X.shape[0]:
+        X, y = X[:n_samples], y[:n_samples]
+
+    print(f"Loaded {dataset_name}: Shape = {X.shape}")
+    return X, y
+
+
+def evaluate_and_plot(name, X, y):
+    t0 = time.time()
+    ml_tsne = MultilevelTSNE()
+    Y_multi = ml_tsne.fit_transform(X)
+    t_multi = time.time() - t0
+
+    t0 = time.time()
+    baseline = TSNE(n_components=2, perplexity=30, max_iter=1000, init='random', method='barnes_hut', random_state=42)
+    Y_base = baseline.fit_transform(X)
+    t_base = time.time() - t0
 
     spec_local = [{"id": "tnc", "params": {"k": 10}}]
+    eval_multi = zadu.ZADU(spec_local, X).measure(Y_multi)[0]
+    eval_base = zadu.ZADU(spec_local, X).measure(Y_base)[0]
 
-    scores_multi = zadu.ZADU(spec_local, X).measure(Y_multilevel)
-    scores_base = zadu.ZADU(spec_local, X).measure(Y_baseline)
-
-    tnc_multi = scores_multi[0]
-    tnc_base = scores_base[0]
-
+    print(f"\nResults for {name}:")
     print(
-        f"Multilevel t-SNE -> Trustworthiness: {tnc_multi['trustworthiness']:.4f} | Continuity: {tnc_multi['continuity']:.4f}")
+        f"  Multilevel t-SNE -> Time: {t_multi:.2f}s | Trustworthiness: {eval_multi['trustworthiness']:.4f} | Continuity: {eval_multi['continuity']:.4f}")
     print(
-        f"Baseline t-SNE   -> Trustworthiness: {tnc_base['trustworthiness']:.4f} | Continuity: {tnc_base['continuity']:.4f}")
+        f"  Baseline t-SNE   -> Time: {t_base:.2f}s | Trustworthiness: {eval_base['trustworthiness']:.4f} | Continuity: {eval_base['continuity']:.4f}")
 
-
-def visualize_embeddings(Y_proposed, Y_baseline, labels):
-    print("\nGenerating visualization plots...")
-
-    if labels is None:
-        c = 'steelblue'
-        cmap = None
-    else:
-        c = labels
-        cmap = 'Spectral'
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7), dpi=100)
-
-    scatter1 = axes[0].scatter(Y_proposed[:, 0], Y_proposed[:, 1], c=c, cmap=cmap, s=5, alpha=0.7)
-    axes[0].set_title("Proposed Multilevel t-SNE Embedding", fontsize=14)
-    axes[0].set_xlabel("Dimension 1")
-    axes[0].set_ylabel("Dimension 2")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), dpi=100)
+    axes[0].scatter(Y_multi[:, 0], Y_multi[:, 1], c=y, cmap='Spectral', s=6, alpha=0.7)
+    axes[0].set_title(f"{name} - Multilevel t-SNE ({t_multi:.2f}s)")
     axes[0].grid(True, linestyle='--', alpha=0.5)
 
-    scatter2 = axes[1].scatter(Y_baseline[:, 0], Y_baseline[:, 1], c=c, cmap=cmap, s=5, alpha=0.7)
-    axes[1].set_title("Standard t-SNE Baseline", fontsize=14)
-    axes[1].set_xlabel("Dimension 1")
+    axes[1].scatter(Y_base[:, 0], Y_base[:, 1], c=y, cmap='Spectral', s=6, alpha=0.7)
+    axes[1].set_title(f"{name} - Standard t-SNE Baseline ({t_base:.2f}s)")
     axes[1].grid(True, linestyle='--', alpha=0.5)
 
-    # Call tight_layout BEFORE adding the colorbar to avoid warning
     plt.tight_layout()
+    plt.savefig(f"{name}_results.png", dpi=300)
+    plt.close()
 
-    if labels is not None:
-        cbar = fig.colorbar(scatter2, ax=axes.ravel().tolist(), fraction=0.03, pad=0.04)
-        cbar.set_label('True Class Label', rotation=270, labelpad=15)
-
-    plt.show()
-
-def download_osf_dataset(dataset_name="Fashion-MNIST"):
-    print(f"Fetching benchmark dataset ({dataset_name})...")
-
-    try:
-        print("Downloading 'Fashion-MNIST' from OpenML...")
-        mnist = fetch_openml('Fashion-MNIST', version=1, as_frame=False, parser='liac-arff')
-        X = mnist.data[:2500].astype(np.float32)
-        y = mnist.target[:2500].astype(int)
-        print(f"Successfully loaded 'Fashion-MNIST': Shape = {X.shape}")
-        return X, y
-
-    except Exception as e:
-        print(f"Could not reach OpenML ({e}). Falling back to Scikit-Learn 'digits' dataset...")
-        digits = load_digits()
-        X = digits.data.astype(np.float32)
-        y = digits.target
-        print(f"Successfully loaded 'digits': Shape = {X.shape}")
-        return X, y
-
-# def download_osf_dataset(dataset_name="coil-20"):
-#     print(f"Fetching benchmark dataset ({dataset_name})...")
-#     try:
-#         coil = fetch_openml(data_id=46783, as_frame=False, parser='liac-arff')
-#         X = coil.data.astype(np.float32)
-#         y = coil.target.astype(int)
-#         print(f"Successfully loaded 'COIL-20': Shape = {X.shape}")
-#         return X, y
-#     except Exception as e:
-#         print(f"Failed to fetch COIL-20: {e}")
-#         raise e
-
-# def download_osf_dataset(dataset_name="USPS"):
-#     print(f"Fetching benchmark dataset ({dataset_name})...")
-#     try:
-#         usps = fetch_openml(data_id=41082, as_frame=False, parser='liac-arff')
-#         X = usps.data[:2500].astype(np.float32)
-#         y = usps.target[:2500].astype(int)
-#         print(f"Successfully loaded 'USPS': Shape = {X.shape}")
-#         return X, y
-#     except Exception as e:
-#         print(f"Failed to fetch USPS: {e}")
-#         raise e
-
-# def download_osf_dataset(dataset_name="MNIST"):
-#     print(f"Fetching benchmark dataset ({dataset_name})...")
-#     try:
-#         mnist = fetch_openml('mnist_784', version=1, as_frame=False, parser='liac-arff')
-#         X = mnist.data[:2500].astype(np.float32)
-#         y = mnist.target[:2500].astype(int)
-#         print(f"Successfully loaded 'MNIST': Shape = {X.shape}")
-#         return X, y
-#     except Exception as e:
-#         print(f"Failed to fetch MNIST: {e}")
-#         raise e
 
 if __name__ == "__main__":
-    X, y = download_osf_dataset(dataset_name="Fashion-MNIST")
+    # Benchmark suite across real datasets
+    datasets_to_test = [
+        ("COIL-20", None),  # Small N (1,440), very high dimensions (16,384)
+        ("Pendigits", None),  # Medium N (10,992), low dimensions (16)
+        ("MNIST", 20000),  # Subsampled large N (20,000), dimensions (784)
+    ]
 
-    print("\nStarting Multilevel t-SNE...")
-    t0 = time.time()
-    ml_tsne = MultilevelTSNE(
-        n_levels=2,
-        perplexity=30,
-        base_iterations=300,
-        refine_iterations=250
-    )
-    Y_proposed = ml_tsne.fit_transform(X)
-    multilevel_time = time.time() - t0
-    print(f"Multilevel t-SNE completed in {multilevel_time:.2f} seconds.")
-
-    print("\nStarting Standard t-SNE Baseline...")
-    t0 = time.time()
-    standard_tsne = TSNE(
-        n_components=2,
-        perplexity=30,
-        max_iter=1000,
-        init='random',
-        random_state=42
-    )
-    Y_baseline = standard_tsne.fit_transform(X)
-    baseline_time = time.time() - t0
-    print(f"Standard t-SNE completed in {baseline_time:.2f} seconds.")
-
-    run_evaluation_experiment(X, Y_proposed, Y_baseline)
-
-    visualize_embeddings(Y_proposed, Y_baseline, y)
+    for name, n_samples in datasets_to_test:
+        X, y = load_dataset(name, n_samples)
+        evaluate_and_plot(name, X, y)
